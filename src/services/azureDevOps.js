@@ -3,6 +3,22 @@
 
 import { azureConfig } from "../config/azure.js";
 
+const REQUIRED_BUG_TAGS = ["QA", "IA"];
+
+export function ensureBugTags(tags) {
+  const uniqueTags = new Map();
+
+  for (const tag of [...REQUIRED_BUG_TAGS, ...(tags || "").split(/[;,]/)]) {
+    const normalizedTag = tag.trim();
+
+    if (normalizedTag && !uniqueTags.has(normalizedTag.toLowerCase())) {
+      uniqueTags.set(normalizedTag.toLowerCase(), normalizedTag);
+    }
+  }
+
+  return [...uniqueTags.values()].join("; ");
+}
+
 async function azureRequest(endpoint, options = {}) {
   const response = await fetch(`${azureConfig.baseUrl}${endpoint}`, {
     ...options,
@@ -154,6 +170,85 @@ export async function getWorkItems(ids) {
 export async function getWorkItem(id) {
   const response = await azureRequest(
     `/_apis/wit/workitems/${id}?$expand=fields&api-version=7.1`
+  );
+
+  return formatWorkItem(response);
+}
+
+export async function createWorkItem({
+  projectName,
+  workItemType,
+  title,
+  description,
+  reproductionSteps,
+  expectedResult,
+  actualResult,
+  assignedTo,
+  areaPath,
+  iterationPath,
+  tag,
+}) {
+  const encodedProjectName = encodeURIComponent(projectName);
+  const encodedWorkItemType = encodeURIComponent(workItemType);
+
+  const bugDescription = `
+<h3>Descrição</h3>
+<p>${description}</p>
+
+<h3>Resultado esperado</h3>
+<p>${expectedResult}</p>
+
+<h3>Comportamento atual</h3>
+<p>${actualResult}</p>
+`;
+
+  const patchDocument = [
+    {
+      op: "add",
+      path: "/fields/System.Title",
+      value: title,
+    },
+    {
+      op: "add",
+      path: "/fields/System.Description",
+      value: bugDescription,
+    },
+    {
+      op: "add",
+      path: "/fields/Microsoft.VSTS.TCM.ReproSteps",
+      value: reproductionSteps,
+    },
+    {
+      op: "add",
+      path: "/fields/System.AssignedTo",
+      value: assignedTo,
+    },
+    {
+      op: "add",
+      path: "/fields/System.AreaPath",
+      value: areaPath,
+    },
+    {
+      op: "add",
+      path: "/fields/System.IterationPath",
+      value: iterationPath,
+    },
+    {
+      op: "add",
+      path: "/fields/System.Tags",
+      value: ensureBugTags(tag),
+    },
+  ].filter(({ value }) => value !== undefined && value !== null && value !== "");
+
+  const response = await azureRequest(
+    `/${encodedProjectName}/_apis/wit/workitems/$${encodedWorkItemType}?api-version=7.1`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json-patch+json",
+      },
+      body: JSON.stringify(patchDocument),
+    }
   );
 
   return formatWorkItem(response);

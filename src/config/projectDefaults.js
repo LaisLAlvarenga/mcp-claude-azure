@@ -3,6 +3,6 @@ export const projectDefaults = {
     assignedTo: null,
     areaPath: "ContaMais",
     iterationPath: null,
-    tag: "QA",
+    tag: "QA; IA",
   },
 };
