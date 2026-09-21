@@ -10,7 +10,95 @@ import {
 
 import { getProjectDefaults } from "../services/projectDefaults.js";
 
-import {getAreaPaths, getIterationPaths, getTeamMembers} from '../services/projectSettings.js';
+import {
+  getAreaPaths,
+  getCurrentProjectIteration,
+  getIterationPaths,
+  getTeamMembers,
+} from "../services/projectSettings.js";
+
+const MAX_SCREENSHOT_COUNT = 5;
+const MAX_SCREENSHOT_SIZE_BYTES = 10 * 1024 * 1024;
+const SUPPORTED_SCREENSHOT_TYPES = ["image/png", "image/jpeg", "image/webp"];
+
+const screenshotSchema = z.object({
+  fileName: z.string().min(1).max(255).describe("Nome do arquivo de imagem, por exemplo: erro-login.png."),
+  contentBase64: z.string().min(1).describe("Conteúdo binário da imagem codificado em Base64, sem o prefixo data:."),
+  mimeType: z.enum(SUPPORTED_SCREENSHOT_TYPES).describe("Tipo da imagem: image/png, image/jpeg ou image/webp."),
+  comment: z.string().max(1000).optional().describe("Comentário opcional exibido junto ao anexo no Azure DevOps."),
+});
+
+function validateScreenshots(attachments) {
+  const invalidFields = [];
+  const screenshots = [];
+
+  if (!attachments) return { invalidFields, screenshots };
+
+  for (const [index, attachment] of attachments.entries()) {
+    const label = `Anexo ${index + 1}`;
+    const normalizedBase64 = attachment.contentBase64.replace(/\s/g, "");
+
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalizedBase64) || normalizedBase64.length % 4 !== 0) {
+      invalidFields.push(`${label}: contentBase64 inválido.`);
+      continue;
+    }
+
+    const content = Buffer.from(normalizedBase64, "base64");
+    const detectedMimeType = detectImageMimeType(content);
+
+    if (content.length === 0) {
+      invalidFields.push(`${label}: a imagem não pode estar vazia.`);
+    } else if (content.length > MAX_SCREENSHOT_SIZE_BYTES) {
+      invalidFields.push(`${label}: excede o limite de 10 MB por imagem.`);
+    } else if (!detectedMimeType) {
+      invalidFields.push(`${label}: o conteúdo não é uma imagem PNG, JPEG ou WebP válida.`);
+    } else if (detectedMimeType !== attachment.mimeType) {
+      invalidFields.push(`${label}: mimeType não corresponde ao conteúdo da imagem.`);
+    } else {
+      screenshots.push({
+        fileName: attachment.fileName,
+        mimeType: attachment.mimeType,
+        comment: attachment.comment,
+        content,
+        sizeBytes: content.length,
+      });
+    }
+  }
+
+  return { invalidFields, screenshots };
+}
+
+function detectImageMimeType(content) {
+  if (
+    content.length >= 8 &&
+    content.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return "image/png";
+  }
+
+  if (content.length >= 3 && content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff) {
+    return "image/jpeg";
+  }
+
+  if (
+    content.length >= 12 &&
+    content.subarray(0, 4).toString("ascii") === "RIFF" &&
+    content.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  return null;
+}
+
+function screenshotMetadata(screenshots) {
+  return screenshots.map(({ fileName, mimeType, comment, sizeBytes }) => ({
+    fileName,
+    mimeType,
+    comment: comment || null,
+    sizeBytes,
+  }));
+}
 
 export function registerWorkItemTools(server) {
   server.tool(
@@ -157,7 +245,14 @@ export function registerWorkItemTools(server) {
       .string()
       .optional()
       .describe(
-        "Iteration Path do Bug. Pode ser informado como caminho completo ou somente pelo nome da sprint."
+        "Iteration Path do Bug. Quando omitido, é usada a sprint ativa se o projeto tiver um único time."
+      ),
+
+    teamName: z
+      .string()
+      .optional()
+      .describe(
+        "Nome do time do Azure DevOps. Necessário quando o projeto possui mais de um time e a sprint ativa deve ser identificada."
       ),
 
     tag: z
@@ -166,6 +261,12 @@ export function registerWorkItemTools(server) {
       .describe(
         "Tag do Bug. Caso não informado, será utilizado o default do projeto quando existir."
       ),
+
+    attachments: z
+      .array(screenshotSchema)
+      .max(MAX_SCREENSHOT_COUNT)
+      .optional()
+      .describe("Prints de tela opcionais. Aceita no máximo 5 imagens PNG, JPEG ou WebP, de até 10 MB cada."),
   },
 
   async ({
@@ -178,15 +279,20 @@ export function registerWorkItemTools(server) {
     assignedTo,
     areaPath,
     iterationPath,
+    teamName,
     tag,
+    attachments,
   }) => {
     const defaults = getProjectDefaults(projectName);
+    const activeIteration = iterationPath
+      ? null
+      : await getCurrentProjectIteration(projectName, teamName);
 
     let resolvedAreaPath =
       areaPath ?? defaults?.areaPath ?? null;
 
     let resolvedIterationPath =
-      iterationPath ?? defaults?.iterationPath ?? null;
+      iterationPath ?? activeIteration?.iterationPath ?? null;
 
     let resolvedAssignedTo =
       assignedTo ?? defaults?.assignedTo ?? null;
@@ -195,6 +301,8 @@ export function registerWorkItemTools(server) {
 
     const missingFields = [];
     const invalidFields = [];
+    const screenshotValidation = validateScreenshots(attachments);
+    invalidFields.push(...screenshotValidation.invalidFields);
 
     // =====================================================
     // CAMPOS OBRIGATÓRIOS
@@ -324,18 +432,30 @@ export function registerWorkItemTools(server) {
               bug: {
                 title,
                 description: description || null,
-                reproductionSteps:
-                  reproductionSteps || null,
-                expectedResult:
-                  expectedResult || null,
-                actualResult:
-                  actualResult || null,
+                reproductionSteps: reproductionSteps || null,
+                expectedResult: expectedResult || null,
+                actualResult: actualResult || null,
 
                 assignedTo: resolvedAssignedTo,
                 areaPath: resolvedAreaPath,
                 iterationPath: resolvedIterationPath,
                 tag: resolvedTag,
+                attachments: screenshotMetadata(screenshotValidation.screenshots),
               },
+
+              iterationResolution: activeIteration
+                ? {
+                    source: activeIteration.iterationPath
+                      ? "active_team_iteration"
+                      : null,
+                    reason: activeIteration.reason,
+                    team: activeIteration.team || null,
+                    availableTeams:
+                      activeIteration.reason === "multiple_teams"
+                        ? activeIteration.teams
+                        : undefined,
+                  }
+                : null,
 
               missingFields,
               invalidFields,
@@ -374,6 +494,7 @@ export function registerWorkItemTools(server) {
       areaPath: z.string().min(1).describe("Area Path aprovado."),
       iterationPath: z.string().min(1).describe("Iteration Path aprovado."),
       tag: z.string().optional().describe("Tag aprovada."),
+      attachments: z.array(screenshotSchema).max(MAX_SCREENSHOT_COUNT).optional().describe("Prints de tela opcionais validados no prepare_bug. Reenvie os mesmos anexos aprovados."),
       confirmed: z.literal(true).describe("Deve ser true somente após o usuário confirmar explicitamente o bug preparado."),
     },
     async ({
@@ -387,7 +508,9 @@ export function registerWorkItemTools(server) {
       areaPath,
       iterationPath,
       tag,
+      attachments,
     }) => {
+      const screenshotValidation = validateScreenshots(attachments);
       const validation = await validateBugFields({
         projectName,
         description,
@@ -398,6 +521,8 @@ export function registerWorkItemTools(server) {
         areaPath,
         iterationPath,
       });
+
+      validation.invalidFields.push(...screenshotValidation.invalidFields);
 
       if (validation.missingFields.length > 0 || validation.invalidFields.length > 0) {
         return {
@@ -427,6 +552,7 @@ export function registerWorkItemTools(server) {
         areaPath: validation.areaPath,
         iterationPath: validation.iterationPath,
         tag,
+        attachments: screenshotValidation.screenshots,
       });
 
       return {
@@ -436,6 +562,7 @@ export function registerWorkItemTools(server) {
             action: "CREATE_BUG",
             created: true,
             bug,
+            attachments: screenshotMetadata(screenshotValidation.screenshots),
             message: "Bug criado com sucesso no Azure DevOps.",
           }, null, 2),
         }],

@@ -187,20 +187,22 @@ export async function createWorkItem({
   areaPath,
   iterationPath,
   tag,
+  attachments = [],
 }) {
   const encodedProjectName = encodeURIComponent(projectName);
   const encodedWorkItemType = encodeURIComponent(workItemType);
-
-  const bugDescription = `
-<h3>Descrição</h3>
-<p>${description}</p>
-
-<h3>Resultado esperado</h3>
-<p>${expectedResult}</p>
-
-<h3>Comportamento atual</h3>
-<p>${actualResult}</p>
-`;
+  const bugDescription = [
+    "<h3>Descrição</h3>",
+    `<p>${description}</p>`,
+    expectedResult?.trim()
+      ? `<h3>Resultado esperado</h3>\n<p>${expectedResult}</p>`
+      : null,
+    actualResult?.trim()
+      ? `<h3>Comportamento atual</h3>\n<p>${actualResult}</p>`
+      : null,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   const patchDocument = [
     {
@@ -238,6 +240,15 @@ export async function createWorkItem({
       path: "/fields/System.Tags",
       value: ensureBugTags(tag),
     },
+    ...(await uploadAttachments(projectName, attachments)).map((attachment) => ({
+      op: "add",
+      path: "/relations/-",
+      value: {
+        rel: "AttachedFile",
+        url: attachment.url,
+        ...(attachment.comment ? { attributes: { comment: attachment.comment } } : {}),
+      },
+    })),
   ].filter(({ value }) => value !== undefined && value !== null && value !== "");
 
   const response = await azureRequest(
@@ -252,6 +263,29 @@ export async function createWorkItem({
   );
 
   return formatWorkItem(response);
+}
+
+async function uploadAttachments(projectName, attachments) {
+  const encodedProjectName = encodeURIComponent(projectName);
+  const uploaded = [];
+
+  for (const attachment of attachments) {
+    const fileName = attachment.fileName.replace(/[\\/]/g, "_");
+    const response = await azureRequest(
+      `/${encodedProjectName}/_apis/wit/attachments?fileName=${encodeURIComponent(fileName)}&api-version=7.1`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": attachment.mimeType,
+        },
+        body: attachment.content,
+      }
+    );
+
+    uploaded.push({ ...response, comment: attachment.comment });
+  }
+
+  return uploaded;
 }
 
 function formatWorkItem(workItem) {

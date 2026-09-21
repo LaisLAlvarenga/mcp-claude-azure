@@ -20,14 +20,76 @@ async function azureRequest(endpoint, options = {}) {
   return response.json();
 }
 
-export async function getTeamMembers(projectName) {
+export async function getProjectTeams(projectName) {
   const encodedProjectName = encodeURIComponent(projectName);
 
   const teamsResponse = await azureRequest(
     `/${encodedProjectName}/_apis/teams?api-version=7.1`
   );
 
-  const teams = teamsResponse.value || [];
+  return (teamsResponse.value || []).map((team) => ({
+    id: team.id,
+    name: team.name,
+    description: team.description || null,
+    url: team.url,
+  }));
+}
+
+export async function getCurrentProjectIteration(projectName, teamName) {
+  const teams = await getProjectTeams(projectName);
+
+  let team = null;
+
+  if (teamName) {
+    const normalizedTeamName = teamName.trim().toLowerCase();
+    team = teams.find(
+      (candidate) => candidate.name?.trim().toLowerCase() === normalizedTeamName
+    );
+
+    if (!team) {
+      return {
+        iterationPath: null,
+        reason: "team_not_found",
+        teams,
+      };
+    }
+  } else if (teams.length === 1) {
+    [team] = teams;
+  } else {
+    return {
+      iterationPath: null,
+      reason: teams.length === 0 ? "no_teams" : "multiple_teams",
+      teams,
+    };
+  }
+
+  const encodedProjectName = encodeURIComponent(projectName);
+  const encodedTeamId = encodeURIComponent(team.id);
+  const response = await azureRequest(
+    `/${encodedProjectName}/${encodedTeamId}/_apis/work/teamsettings/iterations?$timeframe=current&api-version=7.1`
+  );
+  const currentIteration = (response.value || [])[0];
+
+  if (!currentIteration?.path) {
+    return {
+      iterationPath: null,
+      reason: "no_current_iteration",
+      team,
+      teams,
+    };
+  }
+
+  return {
+    iterationPath: currentIteration.path,
+    reason: null,
+    team,
+    teams,
+  };
+}
+
+export async function getTeamMembers(projectName) {
+  const encodedProjectName = encodeURIComponent(projectName);
+  const teams = await getProjectTeams(projectName);
 
   if (teams.length === 0) {
     return [];
